@@ -32,15 +32,40 @@ def get_loaders(batch=128, root="./torch_datasets"):
     def mk(ds, shuf): return DataLoader(ds, batch, shuffle=shuf, drop_last=True)
     return mk(ds_tr, True), mk(ds_va, False), mk(ds_te, False)
 
+
+class SharedRowLinear(nn.Module):
+    """
+    Linear layer whose weight matrix has identical rows:
+        W = 1_{H × 1} · wᵀ ,   w ∈ ℝ^{in_features}
+    so   Wx  = 1_H · (wᵀx)  .
+    """
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        self.row = nn.Parameter(torch.randn(in_features))     # single row w
+        self.out_features = out_features
+        self.register_buffer('_ones', torch.ones(out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(1))
+        else:
+            self.bias = None
+
+    def forward(self, x):              # x shape: (B, in_features)
+        s = x @ self.row               # (B,)   = wᵀx
+        y = s.unsqueeze(-1) * self._ones   # broadcast to (B, out_features)
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
+
 # === Permutation-equivariant GRU (G-GRU) =========================
 class PermEquiGRUCell(nn.Module):
     def __init__(self, input_size, hidden_size, bias=False):
         super().__init__()
         self.hidden_size = hidden_size
         # input → hidden (untied, identical to GRU)
-        self.W_ir = nn.Linear(input_size, hidden_size, bias=bias)
-        self.W_iz = nn.Linear(input_size, hidden_size, bias=bias)
-        self.W_in = nn.Linear(input_size, hidden_size, bias=bias)
+        self.W_ir = SharedRowLinear(input_size, hidden_size, bias=False)
+        self.W_iz = SharedRowLinear(input_size, hidden_size, bias=False)
+        self.W_in = SharedRowLinear(input_size, hidden_size, bias=False)
         # hidden → hidden  (α·I + β·11ᵀ  ⇒ just two learnables / gate)
         for gate in ["r", "z", "n"]:
             self.register_parameter(f"alpha_{gate}",
@@ -138,14 +163,18 @@ def init_edge_of_chaos(model):
 
 def init_uniform(model: nn.Module, p_min=0.1, p_max=3.0):
     p = float(torch.round((torch.rand(1)*(p_max-p_min)+p_min) * 1e3) / 1e3)
-    for mod in model.modules():
-        if isinstance(mod, PermEquiGRUCell):
-            for lin in (mod.W_ir, mod.W_iz, mod.W_in):
-                nn.init.uniform_(lin.weight, -p, p)
-            for name in ["alpha_r","beta_r","alpha_z","beta_z", "alpha_n","beta_n"]:
-                nn.init.uniform_(getattr(mod, name), -p*0.1, p*0.1)  # gentle
-    return p
 
+    for mod in model.modules():
+        # (a) input → hidden: single row vector
+        if isinstance(mod, SharedRowLinear):
+            nn.init.uniform_(mod.row, -p, p)
+
+        # (b) hidden → hidden: α, β scalars
+        if isinstance(mod, PermEquiGRUCell):
+            for name in ["alpha_r","beta_r","alpha_z","beta_z",
+                         "alpha_n","beta_n"]:
+                nn.init.uniform_(getattr(mod, name), -0.1*p, 0.1*p)
+    return p
 
 # Training loop
 def run_epoch(net, loader, crit, opt, train, device, desc):
@@ -256,6 +285,17 @@ def main():
         net = GRUSMNIST(args.hidden).to(device)
         p   = init_uniform(net) #init_edge_of_chaos(net)          # bias trick
         all_p.append(p)
+
+        # ---------- quick equivariance sanity-check
+        H    = args.hidden
+        cell = net.gru.cell          # PermEquiGRUCell instance
+        x    = torch.randn(28, device=device)
+        h    = torch.randn(H,  device=device)
+        perm = torch.randperm(H, device=device)
+
+        assert torch.allclose(cell(x, h)[perm],
+                              cell(x, h[perm]),
+                              atol=1e-6), "Permutation equivariance failed!"
 
         print(f"\n=== Trial {run}/{args.trials}  (p = {p:.3f}) ===")
         # ------------------------------------------------------------------
