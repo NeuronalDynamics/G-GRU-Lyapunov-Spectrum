@@ -2,9 +2,12 @@
 #  gru_smnist_lyap_repro.py  –  exact SMNIST-GRU pipeline (Vogt+24)
 # ================================================================
 """
-Train a 1-layer GRU on *row-wise* Sequential-MNIST (SMNIST) and compute
-its full Lyapunov spectrum, faithfully matching the protocol in
-Vogt et al., “Lyapunov-Guided Representation …” (arXiv:2204.04876).
+# Baseline GRU  : 5 seeds × 7 p values
+python gru_smnist_lyap_repro.py --phase
+
+# GRU + three G-GRU variants (S3,S4,S5)
+python gru_smnist_lyap_repro.py --phase \
+       --group-orders 3,4,5
 """
 
 import os
@@ -36,8 +39,9 @@ def get_loaders(batch=128, root="./torch_datasets"):
 
 # === Permutation-equivariant GRU (G-GRU) =========================
 class PermEquiGRUCell(nn.Module):
-    def __init__(self, input_size, hidden_size, bias=False):
+    def __init__(self, input_size, hidden_size, group_order=3, bias=False):
         super().__init__()
+        self.G = group_order
         self.hidden_size = hidden_size
         # input → hidden (untied, identical to GRU)
         self.W_ir = nn.Linear(input_size, hidden_size, bias=bias)
@@ -52,9 +56,27 @@ class PermEquiGRUCell(nn.Module):
 
     # affine map αh + β1ᵀh
     def _affine(self, gate, h):
+        """
+        Return α·h + β·mean(h)  but compute the mean over permutation orbits.
+
+        Works for both 1-D (H,)   and 2-D (B, H)   hidden states:
+        • Lyapunov code passes 1-D vectors (no batch) → use simple scalar mean
+        • Training / inference passes (B, H)         → mean over last dim
+        """
         α = getattr(self, f"alpha_{gate}")
         β = getattr(self, f"beta_{gate}")
-        return α * h + β * h.mean(dim=-1, keepdim=True)
+
+        if h.dim() == 1:                      # (H,)  — Lyap-spectrum path
+            m = h.mean()
+        else:                                 # (B, H) — normal forward
+            # split hidden units into |G| orbits, then average inside each
+            B, H = h.shape
+            assert H % self.G == 0, \
+                f"hidden_size ({H}) must be multiple of group_order ({self.G})"
+            m = h.view(B, self.G, -1).mean(dim=2)      # (B, |G|)
+            m = m.repeat_interleave(H // self.G, dim=1)  # back to (B, H)
+
+        return α * h + β * m
 
     def forward(self, x_t, h_prev):
         r = torch.sigmoid(self.W_ir(x_t) + self._affine("r", h_prev))
@@ -65,9 +87,11 @@ class PermEquiGRUCell(nn.Module):
 
 class PermEquiGRU(nn.Module):
     """Drop-in replacement for nn.GRU(batch_first=True, one layer)."""
-    def __init__(self, input_size, hidden_size, bias=False):
+    def __init__(self, input_size, hidden_size,
+                 group_order=3, bias=False):
         super().__init__()
-        self.cell = PermEquiGRUCell(input_size, hidden_size, bias)
+        self.cell = PermEquiGRUCell(input_size, hidden_size,
+                                    group_order=group_order, bias=bias)
     def forward(self, seq, h0=None):
         B, T, _ = seq.shape
         if h0 is None:
@@ -82,12 +106,44 @@ class PermEquiGRU(nn.Module):
 # ================================================================
 
 
+class SingleLayerGRU(nn.Module):
+    """A 1-layer GRU implemented with an explicit GRUCell so that
+       .cell exists and the Jacobian code works unchanged."""
+    def __init__(self, input_size, hidden_size, bias=False):
+        super().__init__()
+        self.cell = nn.GRUCell(input_size, hidden_size, bias=bias)
+        self.hidden_size = hidden_size
+
+    def forward(self, seq, h0=None):
+        B, T, _ = seq.shape
+        if h0 is None:
+            h = seq.new_zeros(B, self.hidden_size)
+        else:
+            h = h0.squeeze(0)
+        outs = []
+        for t in range(T):
+            h = self.cell(seq[:, t], h)
+            outs.append(h)
+        return torch.stack(outs, dim=1), h.unsqueeze(0)
+
+
+
 # Model
 class GRUSMNIST(nn.Module):
-    def __init__(self, hidden=64, dropout=0.1):
+    def __init__(self, hidden=64, dropout=0.1, cell_cls=PermEquiGRU,
+                 cell_kwargs=None):
         super().__init__()
         self.hidden = hidden
-        self.gru    = PermEquiGRU(28, hidden, bias=False)#nn.GRU(28, hidden, batch_first=True, bias=False)   # 28 × 28 → 28-step row stream
+        if cell_kwargs is None:
+            cell_kwargs = {}
+        #cell_kwargs = {} if cell_kwargs is None else cell_kwargs
+        # If the caller did NOT specify input_size / hidden_size explicitly,
+        # give them as *positional* args; otherwise rely on **kwargs only.
+        if "input_size" in cell_kwargs or "hidden_size" in cell_kwargs:
+            self.gru = cell_cls(**cell_kwargs)
+        else:
+            self.gru = cell_cls(28, hidden, **cell_kwargs)
+        self.gru    = cell_cls(28, hidden, **cell_kwargs)        
         self.drop   = nn.Dropout(dropout)
         self.fc     = nn.Linear(hidden, 10, bias=False)
 
@@ -283,7 +339,16 @@ def phase_diagram(args):
     for seed, p_val, G in itertools.product(seeds, p_grid, groups):
         torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)  # :contentReference[oaicite:7]{index=7}
         # ---------- model ---------------------------------------------------
-        net = GRUSMNIST(args.hidden).to(device).double()
+        #net = GRUSMNIST(args.hidden).to(device).double()
+        if G is None:                                   # baseline with explicit cell
+            net = GRUSMNIST(args.hidden,
+                            cell_cls=SingleLayerGRU,
+                            cell_kwargs={'bias': False}).to(device).double()
+        else:                                           # permutation-equivariant
+            net = GRUSMNIST(args.hidden,
+                            cell_cls=PermEquiGRU,
+                            cell_kwargs={'group_order': G,
+                                         'bias': False}).to(device).double()
         arch, gtxt = ("GRU", "") if G is None else ("G-GRU", f"S{G}")
         # (If you later expose |G| in PermEquiGRUCell, plug it in here.)
 
@@ -330,7 +395,7 @@ def main():
     ap.add_argument('--seeds', default="0,1,2,3,4",
                     help='comma-separated RNG seeds')
     ap.add_argument('--p-grid',
-                    default="0.05,0.1,0.2,0.4,1,2,3",
+                    default="0.05, 0.1, 0.2, 0.4, 1, 2, 3, 5, 10, 20, 30",
                     help='comma-separated p values (weight scale)')
     ap.add_argument('--group-orders', default="",
                     help='comma-separated permutation group orders; empty ⇒ GRU')
@@ -340,6 +405,12 @@ def main():
                     help='window length over which to average exponents')
 
     args = ap.parse_args()
+
+    # ===================  EARLY-EXIT SWITCH  ==========================
+    if args.phase:                            ### <<< NEW >>>
+        phase_diagram(args)                   ### <<< NEW >>>
+        return                                ### <<< NEW >>>
+    # =================================================================
 
     device = torch.device(args.device)
     _, _, teL = get_loaders(args.batch)

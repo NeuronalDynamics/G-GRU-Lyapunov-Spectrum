@@ -44,7 +44,7 @@ class PermEquiGRUCell(nn.Module):
         # hidden → hidden  (α·I + β·11ᵀ  ⇒ just two learnables / gate)
         for gate in ["r", "z", "n"]:
             self.register_parameter(f"alpha_{gate}",
-                                    nn.Parameter(torch.randn(hidden_size)))
+                                    nn.Parameter(torch.randn(1)))
             self.register_parameter(f"beta_{gate}",
                                     nn.Parameter(torch.randn(1)))
 
@@ -142,8 +142,8 @@ def init_uniform(model: nn.Module, p_min=0.1, p_max=3.0):
         if isinstance(mod, PermEquiGRUCell):
             for lin in (mod.W_ir, mod.W_iz, mod.W_in):
                 nn.init.uniform_(lin.weight, -p, p)
-            for name in ["alpha_r","beta_r","alpha_z","beta_z","alpha_n","beta_n"]:
-                nn.init.uniform_(getattr(mod, name), -p, p)
+            for name in ["alpha_r","beta_r","alpha_z","beta_z", "alpha_n","beta_n"]:
+                nn.init.uniform_(getattr(mod, name), -p*0.1, p*0.1)  # gentle
     return p
 
 
@@ -214,14 +214,14 @@ def lyap_spectrum(model,
     iterator = range(warm, seq.size(0))
     if progress:
         iterator = tqdm(iterator, desc="Lyap-QR", leave=False)
-    for t in iterator:
-        J = gru_jacobian_autograd(cell, seq[t], h)      # (H,H)
-        Q, R = torch.linalg.qr(J @ Q)                   # reduced QR
-        #le_sum += torch.log(torch.abs(torch.diagonal(R)))
-        eps = 1e-12
-        le_sum += torch.log(torch.clamp(torch.abs(torch.diagonal(R)), min=eps))
-        h = cell(seq[t], h)
-        steps += 1
+    with torch.no_grad():                       # avoids saving graphs
+        for t in iterator:
+            J = gru_jacobian_autograd(cell, seq[t], h)  # (H,H)
+            Q, R = torch.linalg.qr(J @ Q)
+            eps = torch.finfo(R.dtype).tiny
+            le_sum += torch.log(torch.clamp(R.diagonal().abs(), min=eps))
+            h = cell(seq[t], h)
+            steps += 1
 
     return (le_sum / steps).cpu()                       # (H,)
 
